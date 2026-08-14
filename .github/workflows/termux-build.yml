@@ -1,0 +1,84 @@
+name: Termux package
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Version to build (e.g., 1.2.3). Leave blank for latest stable."
+                required: false
+                default: ""
+    push:
+        branches:
+            - main
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                arch: [aarch64, arm]
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Determine Version
+              id: get_version
+              run: |
+                  if [ -z "${{ github.event.inputs.version }}" ]; then
+                    # Fetches latest stable release (ignores pre-releases and drafts)
+                    VERSION=$(curl -s https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest | jq -r .tag_name | sed 's/^v//')
+                  else
+                    VERSION="${{ github.event.inputs.version }}"
+                  fi
+                  echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+            - name: Clone termux-packages
+              run: git clone --recursive --single-branch -b master https://github.com/termux/termux-packages
+
+            - name: Add zeroclaw package
+              run: cp -r packages/zeroclaw termux-packages/packages/
+
+            - name: Update build.sh dynamically
+              run: |
+                  cd termux-packages/packages/zeroclaw
+                  wget -q -O source.tar.gz "https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v${{ steps.get_version.outputs.version }}.tar.gz"
+                  SHA256=$(sha256sum source.tar.gz | awk '{print $1}')
+                  rm source.tar.gz
+
+                  # Inject the discovered version and computed SHA256
+                  sed -i "s/TERMUX_PKG_VERSION=.*/TERMUX_PKG_VERSION=${{ steps.get_version.outputs.version }}/" build.sh
+                  sed -i "s/TERMUX_PKG_SHA256=.*/TERMUX_PKG_SHA256=${SHA256}/" build.sh
+
+            - name: Build package using Docker
+              run: |
+                  cd termux-packages
+                  # This officially recommended script handles the NDK, SDK, and all dependencies internally
+                  ./scripts/run-docker.sh ./build-package.sh -a ${{ matrix.arch }} zeroclaw
+
+            - name: Inspect build output
+              run: |
+                  echo "=================================================="
+                  echo "Termux packages build output is located at: termux-packages/output/"
+                  echo "=================================================="
+                  echo ""
+                  echo "Listing contents of termux-packages/output/:"
+                  ls -lh termux-packages/output/ || echo "Directory not found!"
+                  echo ""
+                  echo "=================================================="
+                  echo "Finding all zeroclaw .deb files in the workspace:"
+                  echo "=================================================="
+                  find . -type f -name "zeroclaw*.deb" -exec ls -lh {} \; || echo "No files found!"
+
+            - name: Prepare artifacts
+              run: |
+                  mkdir -p artifacts
+                  # Only copy the zeroclaw .deb files. 
+                  # This filters out downloaded dependencies that contain Debian epoch colons (e.g. "1:")
+                  cp termux-packages/output/zeroclaw*.deb artifacts/
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: zeroclaw-${{ matrix.arch }}-v${{ steps.get_version.outputs.version }}
+                  path: artifacts/
